@@ -39,7 +39,7 @@ def train_price_model():
 
     joblib.dump(model, 'models/price_rf_model.pkl')
     joblib.dump(features, 'models/feature_names.pkl')
-    print("✅ Model zapisany w 'models/price_rf_model.pkl'")
+    print("Model zapisany w 'models/price_rf_model.pkl'")
 
 if __name__ == "__main__":
     train_price_model()

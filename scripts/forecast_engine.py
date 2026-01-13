@@ -9,43 +9,56 @@ def generate_forecasts():
     FORECAST_HISTORY_PATH = DATA_DIR / "forecast_history.parquet"
 
     if not MODEL_PATH.exists():
-        print("❌ Błąd: Brak wytrenowanego modelu w machine_learning/model.joblib")
-        return
+        print("Błąd: Brak wytrenowanego modelu.")
+        return None
 
-    # 1. Wczytanie danych i modelu
     df = pd.read_parquet(FINAL_DATA_PATH)
     model = joblib.load(MODEL_PATH)
     
-    # Definicja cech (musi być identyczna jak przy treningu!)
-    features = ['demand', 'pv', 'wi', 'co2_price_eur', 'hour', 'day_of_week', 'res_share', 'price_lag_1']
+    features = [
+        'demand', 'pv', 'wi', 'co2_price_eur', 
+        'temperature_c', 'wind_speed_ms', 'solar_wm2',
+        'hour_sin', 'hour_cos', 'day_of_week', 
+        'res_share', 'price_lag_24'
+    ]
     
-    # 2. Wybieramy wiersze do prognozowania
-    # Są to wiersze, gdzie price_eur_mwh jest NaN (dane przyszłe) 
-    # LUB po prostu bierzemy ostatnie 48h, żeby mieć pewność, że pokrywamy "dziś i jutro"
-    to_predict = df[features].tail(48) # Prognozujemy ostatnie 2 dni
+    df['date'] = pd.to_datetime(df['date']).dt.tz_convert('UTC') if df['date'].dt.tz else pd.to_datetime(df['date']).dt.tz_localize('UTC')
+
+    to_predict = df.tail(168).copy() # Prognozujemy ostatnie 7 dni + przyszłość dla wykresu
+
+    print(f"Generowanie prognoz dla {len(to_predict)} punktów...")
     
-    # 3. Generowanie prognoz
-    predictions = model.predict(to_predict)
+    X = to_predict[features]
+    predictions = model.predict(X)
     
-    # 4. Przygotowanie ramki wynikowej
     new_forecasts = pd.DataFrame({
-        'date': df.loc[to_predict.index, 'date'],
+        'date': to_predict['date'].values,
         'predicted_price': predictions,
         'forecast_made_at': pd.Timestamp.now(tz='UTC')
     })
-
-    # 5. Zapis/Aktualizacja historii
-    if FORECAST_HISTORY_PATH.exists():
-        old_forecasts = pd.read_parquet(FORECAST_HISTORY_PATH)
-        # Łączymy i usuwamy duplikaty (zachowujemy najnowszą prognozę dla danej godziny)
-        combined = pd.concat([old_forecasts, new_forecasts])
-        combined = combined.drop_duplicates(subset=['date'], keep='last').sort_values('date')
-        combined.to_parquet(FORECAST_HISTORY_PATH)
+    
+    new_forecasts['date'] = pd.to_datetime(new_forecasts['date'])
+    
+    if new_forecasts['date'].dt.tz is None:
+        new_forecasts['date'] = new_forecasts['date'].dt.tz_localize('UTC')
     else:
-        new_forecasts.to_parquet(FORECAST_HISTORY_PATH)
+        new_forecasts['date'] = new_forecasts['date'].dt.tz_convert('UTC')
 
-    print(f"🔮 Wygenerowano prognozy dla zakresu: {new_forecasts['date'].min()} do {new_forecasts['date'].max()}")
-    return new_forecasts
+    if FORECAST_HISTORY_PATH.exists():
+        old_history = pd.read_parquet(FORECAST_HISTORY_PATH)
+        old_history['date'] = pd.to_datetime(old_history['date']).dt.tz_convert('UTC') if old_history['date'].dt.tz else pd.to_datetime(old_history['date']).dt.tz_localize('UTC')
+        combined = pd.concat([old_history, new_forecasts])
+    else:
+        combined = new_forecasts
+
+    combined = combined.drop_duplicates(subset=['date'], keep='last').sort_values('date')
+    
+    combined.to_parquet(FORECAST_HISTORY_PATH)
+    
+    combined.tail(48).to_json(DATA_DIR / "latest_forecast.json", orient='records', date_format='iso')
+
+    print(f"Sukces! Najdalsza prognoza: {combined['date'].max()}")
+    return combined
 
 if __name__ == "__main__":
     generate_forecasts()

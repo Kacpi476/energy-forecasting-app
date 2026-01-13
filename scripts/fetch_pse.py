@@ -27,12 +27,12 @@ def fetch_pse(start, end):
     while current <= end_date:
         date_str = current.strftime("%Y-%m-%d")
         url = BASE_URL.format(date=date_str)
-        print(f"🔄 PSE data: {date_str}")
+        print(f"PSE data: {date_str}")
 
         try:
             resp = requests.get(url)
             if resp.status_code != 200:
-                print(f"⚠ Brak danych dla {date_str}, status: {resp.status_code}")
+                print(f"Brak danych dla {date_str}, status: {resp.status_code}")
                 current += timedelta(days=1)
                 continue
 
@@ -43,7 +43,6 @@ def fetch_pse(start, end):
 
             df = pd.DataFrame(data)
 
-            # ⚡ Zamiast applymap – mapujemy tylko kolumny typu object
             for col in df.select_dtypes(include="object"):
                 df[col] = df[col].map(
                     lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith("{") else x
@@ -58,7 +57,6 @@ def fetch_pse(start, end):
                     rows.append(row)
             df2 = pd.DataFrame(rows)
 
-            # wybór kolumn
             if not set(TARGET_COLUMNS).issubset(df2.columns):
                 current += timedelta(days=1)
                 continue
@@ -79,7 +77,6 @@ def fetch_pse(start, end):
 
     df = pd.concat(all_days).dropna()
 
-    # ustawienie indeksu zgodnie z update_file
     df = df.set_index("dtime_utc").sort_index()
     df.index.name = "date"
 
