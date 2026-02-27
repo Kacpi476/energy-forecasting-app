@@ -14,11 +14,6 @@ BASE_URL = (
 TARGET_COLUMNS = ["dtime_utc", "demand", "pv", "wi", "jg", "jnwrb"]
 
 def fetch_pse(start, end):
-    """
-    Pobiera dane PSE (demand + produkcję) dla zakresu start -> end.
-    Zwraca DataFrame z indeksem 'date' UTC i wszystkimi kolumnami.
-    Obsługuje już istniejące dane – pobiera tylko brakujące dni.
-    """
     all_days = []
 
     current = pd.Timestamp(start).date()

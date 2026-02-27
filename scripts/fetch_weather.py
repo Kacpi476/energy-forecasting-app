@@ -9,18 +9,15 @@ def fetch_weather(start, end):
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
     
-    # Sprawdzamy, czy zakres dotyczy przyszłości
     now = datetime.now(timezone.utc)
-    # Jeśli data końcowa jest późniejsza niż wczoraj, używamy forecast
-    # (API archiwalne zazwyczaj kończy się 2 dni temu)
     is_future = end.date() >= now.date()
 
     if is_future:
         base_url = "https://api.open-meteo.com/v1/forecast"
-        print("🌐 Używam endpointu FORECAST (dane bieżące/przyszłe)")
+        print("endpoint FORECAST (dane bieżące/przyszłe)")
     else:
         base_url = "https://archive-api.open-meteo.com/v1/archive"
-        print("🏛️ Używam endpointu ARCHIVE (dane historyczne)")
+        print("endpoint ARCHIVE (dane historyczne)")
 
     url = (
         f"{base_url}?"
