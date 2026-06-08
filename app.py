@@ -98,17 +98,46 @@ if df.empty and df_back.empty:
 
 # ── Stałe 
 START_VIEW   = pd.Timestamp("2026-01-01", tz='UTC')
-NOW_UTC      = pd.Timestamp.now(tz='UTC')
+NOW_UTC      = pd.Timestamp("2026-06-06 22:00:00", tz='UTC')  # DEMO: linia "TERAZ" na potrzeby pracy licencjackiej
 DARK_TEMPLATE = "plotly_dark"
 
-hist = df[df['date'] >= START_VIEW].dropna(subset=['price_eur_mwh']) if not df.empty else pd.DataFrame()
+# Budujemy hist z dwóch źródeł:
+# 1. final_training_data.parquet – historyczne ceny treningowe
+# 2. forecast_history.parquet    – ceny realne dodane przez add_real_prices.py
+#    (dla godzin po zakończeniu zbioru treningowego)
+if not df.empty:
+    hist_train = df[['date', 'price_eur_mwh']].copy()
+else:
+    hist_train = pd.DataFrame(columns=['date', 'price_eur_mwh'])
+
+if not df_back.empty and 'price_eur_mwh' in df_back.columns:
+    # Weź tylko te rekordy z forecast_history gdzie jest cena realna
+    hist_back = df_back[df_back['price_eur_mwh'].notna()][['date', 'price_eur_mwh']].copy()
+else:
+    hist_back = pd.DataFrame(columns=['date', 'price_eur_mwh'])
+
+# Połącz oba źródła, usuń duplikaty (pierwszeństwo ma forecast_history dla nakładających się dat)
+hist_combined = pd.concat([hist_train, hist_back], ignore_index=True)
+hist_combined = hist_combined.sort_values('date')
+hist_combined = hist_combined.drop_duplicates(subset='date', keep='last')
+
+hist = hist_combined[hist_combined['date'] >= START_VIEW].dropna(subset=['price_eur_mwh'])
+
 back = df_back[df_back['date'] >= START_VIEW] if not df_back.empty else pd.DataFrame()
 
 if not back.empty:
-    back_hist   = back[back['date'] <= NOW_UTC]
+    # Ostatnia znana cena rzeczywista — tu kończy się niebieska linia
+    last_real_ts = hist['date'].max() if not hist.empty else NOW_UTC
+
+    # back_hist   — prognoza historyczna (do porównania z ceną realną)
+    # back_bridge — strefa między końcem cen realnych a TERAZ (wypełnia przerwę)
+    # back_future — prognoza operacyjna (po linii TERAZ)
+    back_hist   = back[back['date'] <= last_real_ts]
+    back_bridge = back[(back['date'] > last_real_ts) & (back['date'] <= NOW_UTC)]
     back_future = back[back['date'] >  NOW_UTC]
 else:
     back_hist   = pd.DataFrame()
+    back_bridge = pd.DataFrame()
     back_future = pd.DataFrame()
 
 # SEKCJA 1 – Cena realna vs prognoza
@@ -139,6 +168,21 @@ else:
             name="Backtest modelu",
             line=dict(color='#ff7043', width=1.5, dash='dot'),
             hovertemplate="%{x|%d.%m %H:%M}<br><b>%{y:.1f} EUR/MWh</b><extra>Backtest</extra>"
+        ))
+
+    # Bridge: łączy koniec cen realnych z linią TERAZ — eliminuje przerwę na wykresie
+    # Powstaje gdy ceny realne są opóźnione względem czasu rzeczywistego
+    if not back_bridge.empty:
+        if not back_hist.empty:
+            bridge_data = pd.concat([back_hist.tail(1), back_bridge], ignore_index=True)
+        else:
+            bridge_data = back_bridge
+
+        fig1.add_trace(go.Scatter(
+            x=bridge_data['date'], y=bridge_data['predicted_price'],
+            name="Prognoza bieżąca (oczekiwanie na ceny)",
+            line=dict(color='#ffd54f', width=2, dash='dash'),
+            hovertemplate="%{x|%d.%m %H:%M}<br><b>%{y:.1f} EUR/MWh</b><extra>Prognoza bieżąca</extra>"
         ))
 
     if not back_future.empty:
@@ -281,13 +325,17 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if back_hist.empty or hist.empty:
+# Do MAE używamy pełnego back (zawiera predicted_price dla całej historii)
+# back_hist byłby za wąski — jest cięty do last_real_ts
+back_for_mae = back[back['predicted_price'].notna()] if not back.empty else pd.DataFrame()
+
+if back_for_mae.empty or hist.empty:
     st.markdown('<div class="warn-box">Niewystarczające dane backtestu do obliczenia MAE tygodniowego.</div>',
                 unsafe_allow_html=True)
 else:
     merged_full = pd.merge(
         hist[['date', 'price_eur_mwh']],
-        back_hist[['date', 'predicted_price']],
+        back_for_mae[['date', 'predicted_price']],
         on='date'
     ).dropna()
 
@@ -370,6 +418,7 @@ else:
         st.markdown('<div class="warn-box">Prognoza dostępna, ale poza oknem 24h. Sprawdź horyzont modelu.</div>',
                     unsafe_allow_html=True)
     else:
+        next_24h = next_24h.dropna(subset=['predicted_price'])
         next_24h = next_24h.sort_values('date').reset_index(drop=True)
 
         display_cols = {'date': 'Data i godzina (UTC)', 'predicted_price': 'Prognoza ceny (EUR/MWh)'}
@@ -390,13 +439,16 @@ else:
         max_p = table['Prognoza ceny (EUR/MWh)'].max()
 
         def color_price(val):
-            if max_p == min_p:
+            try:
+                if pd.isna(val) or max_p == min_p:
+                    return 'background-color: #1a2744'
+                t = (float(val) - min_p) / (max_p - min_p)
+                r = int(46  + t * (198 - 46))
+                g = int(142 + t * (40  - 142))
+                b = int(60  + t * (40  - 60))
+                return f'background-color: rgba({r},{g},{b},0.35)'
+            except (TypeError, ValueError):
                 return 'background-color: #1a2744'
-            t = (val - min_p) / (max_p - min_p)
-            r = int(46  + t * (198 - 46))
-            g = int(142 + t * (40  - 142))
-            b = int(60  + t * (40  - 60))
-            return f'background-color: rgba({r},{g},{b},0.35)'
 
         styled = table.style.applymap(color_price, subset=['Prognoza ceny (EUR/MWh)'])
         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -427,3 +479,4 @@ st.caption(
     "Model: Random Forest Regressor · n_estimators=200 · max_depth=12  |  "
     "Źródła: ENTSO-E, PSE, Open-Meteo, KEUA (CO₂)"
 )
+

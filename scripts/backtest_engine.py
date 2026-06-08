@@ -1,53 +1,95 @@
 import pandas as pd
+import numpy as np
 import joblib
 from pathlib import Path
 
+
 def run_backtest():
+    """
+    Silnik prognozowania Day-Ahead:
+    - Identyfikuje ostatni pełny dzień z cenami rzeczywistymi (T)
+    - Generuje prognozę dla WSZYSTKICH godzin po T (dzień bieżący + kolejne doby)
+    - Zapisuje wynik do forecast_history.parquet BEZ dziur czasowych
+
+    UWAGA: forecast_mask nie filtruje po isna() — prognozujemy cały zakres od T+1,
+    niezależnie od tego czy godziny bieżącego dnia mają już ceny częściowe.
+    Dzięki temu app.py zawsze ma ciągłą linię prognozy bez przerw.
+    """
     DATA_DIR = Path("data")
     MODEL_PATH = Path("models/price_rf_model.pkl")
     FEATURES_PATH = Path("models/feature_names.pkl")
-    
+
+    if not MODEL_PATH.exists() or not FEATURES_PATH.exists():
+        print("Błąd: Brak pliku modelu. Uruchom najpierw train_model_final.py.")
+        return
+
     df = pd.read_parquet(DATA_DIR / "final_training_data.parquet")
     model = joblib.load(MODEL_PATH)
     features = joblib.load(FEATURES_PATH)
-    df['date'] = pd.to_datetime(df['date'], utc=True)
-    df = df.sort_values('date').reset_index(drop=True)
 
+    df["date"] = pd.to_datetime(df["date"], utc=True)
+    df = df.sort_values("date").reset_index(drop=True)
+    df["day"] = df["date"].dt.date
 
-    df['day'] = df['date'].dt.date
-
-    price_counts = df[df['price_eur_mwh'].notna()].groupby('day').size()
+    # --- Znajdź ostatni dzień z kompletem 24h cen rzeczywistych ---
+    price_counts = df[df["price_eur_mwh"].notna()].groupby("day").size()
     full_days = price_counts[price_counts == 24].index.tolist()
 
     if not full_days:
-        print("Brak pełnych dób (24h) z cenami w pliku!")
+        print("Błąd: Brak pełnych dób (24h) z cenami w pliku!")
         return
 
     last_full_day = max(full_days)
-    
-    forecast_target_day = last_full_day + pd.Timedelta(days=1)
+    print(f"Ostatni pełny dzień z cenami: {last_full_day}")
 
-    print(f"Ostatni pełny dzień danych: {last_full_day}")
-    print(f"Generuję prognozę na całą dobę: {forecast_target_day}")
+    # --- Wyznacz zakres prognozy: WSZYSTKIE rekordy po ostatnim pełnym dniu ---
+    # Celowo NIE filtrujemy po isna() — chcemy prognozę dla całego okresu od T+1,
+    # nawet jeśli część godzin dnia bieżącego ma już ceny częściowe.
+    # Eliminuje to dziury między ostatnią ceną realną a pierwszą prognozą.
+    forecast_mask = df["day"] > last_full_day
+    forecast_rows = df[forecast_mask]
 
-    forecast_mask = df['day'] == forecast_target_day
-    if df[forecast_mask].shape[0] < 24:
-        print(f"Brak pełnych danych pogodowych na {forecast_target_day}")
+    if forecast_rows.empty:
+        print("Brak godzin do prognozowania — dane są aktualne.")
         return
 
-    plot_df = df[df['day'] <= forecast_target_day].copy()
+    forecast_days = sorted(forecast_rows["day"].unique())
+    print(f"Generuję prognozę dla {len(forecast_rows)}h "
+          f"({forecast_days[0]} -> {forecast_days[-1]})")
 
-    plot_df['price_lag_24'] = plot_df['price_eur_mwh'].shift(24)
+    # --- Bezpieczne obliczenie price_lag_24 ---
+    # shift(24) na całym DF: dla godziny H bierzemy cenę z H-24 (realna lub ostatnia znana).
+    # ffill() wypełnia luki w strefie bez cen — model nigdy nie widzi ceny z przyszłości.
+    plot_df = df.copy()
+    plot_df["price_lag_24"] = plot_df["price_eur_mwh"].shift(24).ffill()
 
-    X = plot_df[features].ffill().bfill()
-    plot_df['predicted_price'] = model.predict(X)
+    lag_missing = plot_df.loc[forecast_mask, "price_lag_24"].isna().sum()
+    if lag_missing > 0:
+        print(f"Brakuje {lag_missing} wartosci price_lag_24 — uzupelniam bfill.")
+        plot_df["price_lag_24"] = plot_df["price_lag_24"].bfill()
 
-    output_df = plot_df[['date', 'price_eur_mwh', 'predicted_price']]
-    output_df.to_parquet(DATA_DIR / "forecast_history.parquet")
+    # --- Predykcja ---
+    X = plot_df.loc[forecast_mask, features].copy()
 
-    print(f"Wygenerowano prognozę.")
-    print(f"Zakres wykresu: {output_df['date'].min().date()} do {output_df['date'].max().date()}")
-    print(f"Jutro ({forecast_target_day}) ma {len(output_df[output_df['date'].dt.date == forecast_target_day])}h prognozy.")
+    missing_cols = X.columns[X.isna().any()].tolist()
+    if missing_cols:
+        print(f"Braki danych w cechach: {missing_cols}. Uzupelniam ffill/bfill.")
+        X = X.ffill().bfill()
+
+    day_preds = model.predict(X)
+    plot_df.loc[forecast_mask, "predicted_price"] = day_preds
+
+    # --- Zapis wyników ---
+    output_df = plot_df[["date", "price_eur_mwh", "predicted_price"]].copy()
+    output_df.to_parquet(DATA_DIR / "forecast_history.parquet", index=False)
+
+    print(f"Prognoza wygenerowana.")
+    print(f"   Godzin: {len(day_preds)} | "
+          f"Srednia: {day_preds.mean():.2f} | Min: {day_preds.min():.2f} | Max: {day_preds.max():.2f} EUR/MWh")
+    print(f"   Zakres: {output_df['date'].min().date()} -> {output_df['date'].max().date()}")
+    print(f"   Ostatnia cena realna: {output_df[output_df['price_eur_mwh'].notna()]['date'].max()}")
+    print(f"   Pierwsza prognoza:    {output_df[output_df['predicted_price'].notna()]['date'].min()}")
+
 
 if __name__ == "__main__":
     run_backtest()

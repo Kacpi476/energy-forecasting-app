@@ -1,59 +1,116 @@
+"""
+run_historical_backtest.py
+--------------------------
+Przelicza predicted_price dla całego okresu historycznego (walk-forward).
+Dla każdego dnia T generuje prognozę używając wyłącznie danych dostępnych
+przed T (brak data leakage). Wynik łączy z bieżącymi prognozami operacyjnymi
+z forecast_history.parquet — nie nadpisuje przyszłości.
+
+Uruchom raz przed obroną żeby sekcja 3 (MAE tygodniowy) miała pełne dane.
+Czas działania: ~2-5 minut.
+"""
+
 import pandas as pd
+import numpy as np
 import joblib
 from pathlib import Path
 from tqdm import tqdm
 
+DATA_DIR   = Path("data")
+MODEL_PATH = Path("models/price_rf_model.pkl")
+FEATURES_PATH = Path("models/feature_names.pkl")
+
+# Backtest od kiedy — pierwsze pełne dane treningowe
+BACKTEST_START = pd.Timestamp("2025-01-01", tz="UTC")
+
+
 def run_historical_backtest():
-    DATA_DIR = Path("data")
-    MODEL_PATH = Path("models/price_rf_model.pkl")
-    FEATURES_PATH = Path("models/feature_names.pkl")
-    
-    # 1. Wczytujemy dane i model
+    if not MODEL_PATH.exists():
+        print("Brak modelu. Uruchom najpierw train_model_final.py.")
+        return
+
     df = pd.read_parquet(DATA_DIR / "final_training_data.parquet")
-    model = joblib.load(MODEL_PATH)
-    features = joblib.load(FEATURES_PATH)
-    df['date'] = pd.to_datetime(df['date'], utc=True)
-    df = df.sort_values('date').reset_index(drop=True)
-    
-    # Przygotowujemy kolumnę na wyniki backtestu
-    df['predicted_price'] = None 
-    
-    # 2. Definiujemy zakres: od 1 stycznia 2026 do dzisiaj
-    start_date = pd.Timestamp("2026-01-01", tz='UTC').date()
-    end_date = df['date'].max().date()
-    
-    all_days = pd.date_range(start_date, end_date, freq='D')
-    
-    print(f"🚀 Rozpoczynam historyczny backtest od {start_date} do {end_date}...")
+    model     = joblib.load(MODEL_PATH)
+    features  = joblib.load(FEATURES_PATH)
 
-    # 3. Pętla dzień po dniu
-    for current_day in tqdm(all_days):
-        # Sprawdzamy, czy poprzedni dzień (T-1) ma komplet 24h danych (cen)
-        yesterday = current_day - pd.Timedelta(days=1)
-        yesterday_data = df[df['date'].dt.date == yesterday.date()]
-        
-        # WARUNEK: Robimy prognozę na 'current_day' tylko jeśli 'yesterday' ma komplet cen
-        if yesterday_data['price_eur_mwh'].notna().sum() == 24:
-            
-            # Pobieramy dane na dzień, który chcemy prognozować
-            target_day_mask = df['date'].dt.date == current_day.date()
-            target_data = df[target_day_mask].copy()
-            
-            if not target_data.empty:
-                # Generujemy lagi dla tego konkretnego dnia na podstawie 'yesterday'
-                # (W backteście możemy użyć shift(24) na całym DF, co jest szybsze)
-                X = target_data[features].ffill().bfill()
-                
-                # Zapisujemy prognozę w głównym DataFrame
-                df.loc[target_day_mask, 'predicted_price'] = model.predict(X)
+    df["date"] = pd.to_datetime(df["date"], utc=True)
+    df = df.sort_values("date").reset_index(drop=True)
+    df["day"]  = df["date"].dt.date
 
-    # 4. ZAPIS WYNIKÓW
-    # Zapisujemy tylko okres od 1 stycznia, żeby nie puchły pliki
-    output_df = df[df['date'].dt.date >= start_date].copy()
-    output_df.to_parquet(DATA_DIR / "forecast_history.parquet")
-    
-    print(f"\n✅ Backtest zakończony!")
-    print(f"📊 Wygenerowano prognozy dla {output_df['predicted_price'].notna().sum() // 24} dni.")
+    # Kolumna wynikowa
+    df["predicted_price"] = np.nan
+
+    # Dni z kompletem 24h cen — na nich będziemy bazować lagi
+    price_counts = df[df["price_eur_mwh"].notna()].groupby("day").size()
+    full_days    = sorted(price_counts[price_counts == 24].index.tolist())
+
+    # Zakres backtestowy: od BACKTEST_START do przedostatniego pełnego dnia
+    # (ostatni zostawiamy dla bieżącej prognozy)
+    backtest_days = [d for d in full_days if pd.Timestamp(d, tz="UTC") >= BACKTEST_START]
+
+    if len(backtest_days) < 2:
+        print("Za mało danych historycznych do backtestowania.")
+        return
+
+    print(f"Backtest: {backtest_days[0]} → {backtest_days[-1]} ({len(backtest_days)} dni)")
+
+    # Walk-forward: dla każdego dnia T generujemy prognozę
+    # używając price_lag_24 z dnia T-1 (realne ceny, bez leakage)
+    for target_day in tqdm(backtest_days, desc="Backtest"):
+        day_mask = df["day"] == target_day
+        rows     = df[day_mask]
+
+        if len(rows) < 24:
+            continue
+
+        # price_lag_24: shift(24) na całym df do tego dnia włącznie
+        df_to_day = df[df["day"] <= target_day].copy()
+        df_to_day["price_lag_24"] = df_to_day["price_eur_mwh"].shift(24).ffill()
+
+        X = df_to_day.loc[day_mask, features].copy()
+
+        if X.isna().any().any():
+            X = X.ffill().bfill()
+
+        preds = model.predict(X)
+        df.loc[day_mask, "predicted_price"] = preds
+
+    # --- Połącz z bieżącymi prognozami operacyjnymi ---
+    forecast_path = DATA_DIR / "forecast_history.parquet"
+    if forecast_path.exists():
+        current = pd.read_parquet(forecast_path)
+        current["date"] = pd.to_datetime(current["date"], utc=True)
+
+        # Zachowaj bieżące prognozy operacyjne (przyszłość)
+        last_backtest_day = pd.Timestamp(backtest_days[-1], tz="UTC")
+        future_preds = current[
+            current["date"] > last_backtest_day + pd.Timedelta(hours=23)
+        ][["date", "predicted_price"]].copy()
+
+        if not future_preds.empty:
+            # Wpisz przyszłe prognozy do głównego df
+            df = df.merge(
+                future_preds.rename(columns={"predicted_price": "pred_future"}),
+                on="date", how="left"
+            )
+            future_mask = df["pred_future"].notna()
+            df.loc[future_mask, "predicted_price"] = df.loc[future_mask, "pred_future"]
+            df.drop(columns=["pred_future"], inplace=True)
+            print(f"Zachowano {len(future_preds)} godzin bieżącej prognozy operacyjnej.")
+
+    # Zapis
+    output = df[["date", "price_eur_mwh", "predicted_price"]].copy()
+    output.to_parquet(forecast_path, index=False)
+
+    overlap = (output["predicted_price"].notna() & output["price_eur_mwh"].notna()).sum()
+    mae = (output["price_eur_mwh"] - output["predicted_price"]).abs().mean()
+
+    print(f"\nGotowe!")
+    print(f"  Predicted notna : {output['predicted_price'].notna().sum()}")
+    print(f"  Price notna     : {output['price_eur_mwh'].notna().sum()}")
+    print(f"  Overlap (MAE)   : {overlap} godzin")
+    print(f"  MAE globalny    : {mae:.2f} EUR/MWh")
+
 
 if __name__ == "__main__":
     run_historical_backtest()
