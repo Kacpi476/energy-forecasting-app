@@ -9,7 +9,7 @@ def run_backtest():
     Silnik prognozowania Day-Ahead:
     - Identyfikuje ostatni pełny dzień z cenami rzeczywistymi (T)
     - Generuje prognozę dla WSZYSTKICH godzin po T (dzień bieżący + kolejne doby)
-    - Zapisuje wynik do forecast_history.parquet BEZ dziur czasowych
+    - Dopisuje nowe prognozy do forecast_history.parquet BEZ nadpisywania historii
 
     UWAGA: forecast_mask nie filtruje po isna() — prognozujemy cały zakres od T+1,
     niezależnie od tego czy godziny bieżącego dnia mają już ceny częściowe.
@@ -44,9 +44,6 @@ def run_backtest():
     print(f"Ostatni pełny dzień z cenami: {last_full_day}")
 
     # --- Wyznacz zakres prognozy: WSZYSTKIE rekordy po ostatnim pełnym dniu ---
-    # Celowo NIE filtrujemy po isna() — chcemy prognozę dla całego okresu od T+1,
-    # nawet jeśli część godzin dnia bieżącego ma już ceny częściowe.
-    # Eliminuje to dziury między ostatnią ceną realną a pierwszą prognozą.
     forecast_mask = df["day"] > last_full_day
     forecast_rows = df[forecast_mask]
 
@@ -59,8 +56,6 @@ def run_backtest():
           f"({forecast_days[0]} -> {forecast_days[-1]})")
 
     # --- Bezpieczne obliczenie price_lag_24 ---
-    # shift(24) na całym DF: dla godziny H bierzemy cenę z H-24 (realna lub ostatnia znana).
-    # ffill() wypełnia luki w strefie bez cen — model nigdy nie widzi ceny z przyszłości.
     plot_df = df.copy()
     plot_df["price_lag_24"] = plot_df["price_eur_mwh"].shift(24).ffill()
 
@@ -80,16 +75,27 @@ def run_backtest():
     day_preds = model.predict(X)
     plot_df.loc[forecast_mask, "predicted_price"] = day_preds
 
-    # --- Zapis wyników ---
-    output_df = plot_df[["date", "price_eur_mwh", "predicted_price"]].copy()
-    output_df.to_parquet(DATA_DIR / "forecast_history.parquet", index=False)
+    # --- Zapis wyników: dopisuj do istniejącego pliku, nie nadpisuj ---
+    forecast_path = DATA_DIR / "forecast_history.parquet"
+    new_forecasts = plot_df.loc[forecast_mask, ["date", "price_eur_mwh", "predicted_price"]].copy()
+
+    if forecast_path.exists():
+        old = pd.read_parquet(forecast_path)
+        old["date"] = pd.to_datetime(old["date"], utc=True)
+        # Zachowaj historyczny backtest, dopisz tylko nowe prognozy operacyjne
+        combined = pd.concat([old, new_forecasts])
+        combined = combined.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+    else:
+        combined = new_forecasts
+
+    combined.to_parquet(forecast_path, index=False)
 
     print(f"Prognoza wygenerowana.")
     print(f"   Godzin: {len(day_preds)} | "
           f"Srednia: {day_preds.mean():.2f} | Min: {day_preds.min():.2f} | Max: {day_preds.max():.2f} EUR/MWh")
-    print(f"   Zakres: {output_df['date'].min().date()} -> {output_df['date'].max().date()}")
-    print(f"   Ostatnia cena realna: {output_df[output_df['price_eur_mwh'].notna()]['date'].max()}")
-    print(f"   Pierwsza prognoza:    {output_df[output_df['predicted_price'].notna()]['date'].min()}")
+    print(f"   Zakres forecast_history: {combined['date'].min().date()} -> {combined['date'].max().date()}")
+    print(f"   Ostatnia cena realna: {combined[combined['price_eur_mwh'].notna()]['date'].max()}")
+    print(f"   Pierwsza prognoza:    {combined[combined['predicted_price'].notna()]['date'].min()}")
 
 
 if __name__ == "__main__":
