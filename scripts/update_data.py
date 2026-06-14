@@ -12,7 +12,7 @@ from backtest_engine import run_backtest
 
 load_dotenv()
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 PRICES_FILE = DATA_DIR / "prices.parquet"

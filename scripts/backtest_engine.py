@@ -15,9 +15,10 @@ def run_backtest():
     niezależnie od tego czy godziny bieżącego dnia mają już ceny częściowe.
     Dzięki temu app.py zawsze ma ciągłą linię prognozy bez przerw.
     """
-    DATA_DIR = Path("data")
-    MODEL_PATH = Path("models/price_rf_model.pkl")
-    FEATURES_PATH = Path("models/feature_names.pkl")
+    BASE_DIR = Path(__file__).parent.parent
+    DATA_DIR = BASE_DIR / "data"
+    MODEL_PATH = BASE_DIR / "models/price_rf_model.pkl"
+    FEATURES_PATH = BASE_DIR / "models/feature_names.pkl"
 
     if not MODEL_PATH.exists() or not FEATURES_PATH.exists():
         print("Błąd: Brak pliku modelu. Uruchom najpierw train_model_final.py.")

@@ -6,7 +6,7 @@ START_DATE = "2024-07-01"
 
 
 def merge_datasets():
-    DATA_DIR = Path("data")
+    DATA_DIR = Path(__file__).parent.parent / "data"
 
     prices  = pd.read_parquet(DATA_DIR / "prices.parquet")
     pse     = pd.read_parquet(DATA_DIR / "pse.parquet")
